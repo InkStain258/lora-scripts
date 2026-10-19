@@ -18,7 +18,8 @@ import logging
 logger = logging.getLogger(__name__)
 
 from library import flux_models
-from library.utils import load_safetensors
+from library.safetensors_utils import load_safetensors
+from library.clip_text_model import wrap_clip_text_model
 
 MODEL_VERSION_FLUX_V1 = "flux1"
 MODEL_NAME_DEV = "dev"
@@ -124,7 +125,7 @@ def load_flow_model(
         logger.info(f"Loading state dict from {ckpt_path}")
         sd = {}
         for ckpt_path in ckpt_paths:
-            sd.update(load_safetensors(ckpt_path, device=str(device), disable_mmap=disable_mmap, dtype=dtype))
+            sd.update(load_safetensors(ckpt_path, device=device, disable_mmap=disable_mmap, dtype=dtype))
 
         # convert Diffusers to BFL
         if is_diffusers:
@@ -220,8 +221,12 @@ class DummyTextModel(torch.nn.Module):
 class DummyCLIPL(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.output_shape = (77, 1) # Note: The original code had (77, 768), but we use (77, 1) for the dummy output
-        self.dummy_param = torch.nn.Parameter(torch.zeros(1))  # get dtype and device from this parameter
+        self.output_shape = (77, 1)  # Note: The original code had (77, 768), but we use (77, 1) for the dummy output
+
+        # dtype and device from these parameters. train_network.py accesses them
+        self.dummy_param = torch.nn.Parameter(torch.zeros(1))
+        self.dummy_param_2 = torch.nn.Parameter(torch.zeros(1))
+        self.dummy_param_3 = torch.nn.Parameter(torch.zeros(1))
         self.text_model = DummyTextModel()
 
     @property
@@ -338,7 +343,7 @@ def load_clip_l(
     }
     config = CLIPConfig(**CLIPL_CONFIG)
     with init_empty_weights():
-        clip = CLIPTextModel._from_config(config)
+        clip = wrap_clip_text_model(CLIPTextModel._from_config(config))
 
     if state_dict is not None:
         sd = state_dict

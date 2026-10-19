@@ -1,10 +1,12 @@
-import glob
+﻿import glob
 import os
 from typing import Any, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
-from transformers import CLIPTokenizer
-from library import train_util
+from library.clip_tokenizer import CLIPTokenizer  # transformers.CLIPTokenizer with the legacy (ftfy) text normalization
+from library import accelerator_setup
+import library.device_utils as device_utils
 from library.strategy_base import LatentsCachingStrategy, TokenizeStrategy, TextEncodingStrategy
 from library.utils import setup_logging
 
@@ -15,7 +17,13 @@ logger = logging.getLogger(__name__)
 
 
 TOKENIZER_ID = "openai/clip-vit-large-patch14"
-V2_STABLE_DIFFUSION_ID = "stabilityai/stable-diffusion-2"  # ここからtokenizerだけ使う v2とv2.1はtokenizer仕様は同じ
+
+# The SD2.x tokenizer (previously loaded from stabilityai/stable-diffusion-2, which is no longer accessible on the Hub)
+# is the v1 (OpenAI CLIP) tokenizer with "!" (id 0) as the pad token instead of <|endoftext|>: same vocabulary,
+# same merges, same token ids. So it is built from the v1 tokenizer. v2 and v2.1 use the same tokenizer.
+V2_TOKENIZER_PAD_TOKEN = "!"
+# directory name under --tokenizer_cache_dir, kept so that existing caches of the v2 tokenizer are still used
+V2_TOKENIZER_CACHE_NAME = "stabilityai_stable-diffusion-2"
 
 
 class SdTokenizeStrategy(TokenizeStrategy):
@@ -26,7 +34,11 @@ class SdTokenizeStrategy(TokenizeStrategy):
         logger.info(f"Using {'v2' if v2 else 'v1'} tokenizer")
         if v2:
             self.tokenizer = self._load_tokenizer(
-                CLIPTokenizer, V2_STABLE_DIFFUSION_ID, subfolder="tokenizer", tokenizer_cache_dir=tokenizer_cache_dir
+                CLIPTokenizer,
+                TOKENIZER_ID,
+                tokenizer_cache_dir=tokenizer_cache_dir,
+                cache_name=V2_TOKENIZER_CACHE_NAME,
+                pad_token=V2_TOKENIZER_PAD_TOKEN,
             )
         else:
             self.tokenizer = self._load_tokenizer(CLIPTokenizer, TOKENIZER_ID, tokenizer_cache_dir=tokenizer_cache_dir)
@@ -144,7 +156,7 @@ class SdSdxlLatentsCachingStrategy(LatentsCachingStrategy):
         self.suffix = (
             SdSdxlLatentsCachingStrategy.SD_LATENTS_NPZ_SUFFIX if sd else SdSdxlLatentsCachingStrategy.SDXL_LATENTS_NPZ_SUFFIX
         )
-    
+
     @property
     def cache_suffix(self) -> str:
         return self.suffix
@@ -157,7 +169,12 @@ class SdSdxlLatentsCachingStrategy(LatentsCachingStrategy):
         return os.path.splitext(absolute_path)[0] + f"_{image_size[0]:04d}x{image_size[1]:04d}" + self.suffix
 
     def is_disk_cached_latents_expected(self, bucket_reso: Tuple[int, int], npz_path: str, flip_aug: bool, alpha_mask: bool):
-        return self._default_is_disk_cached_latents_expected(8, bucket_reso, npz_path, flip_aug, alpha_mask)
+        return self._default_is_disk_cached_latents_expected(8, bucket_reso, npz_path, flip_aug, alpha_mask, multi_resolution=True)
+
+    def load_latents_from_disk(
+        self, npz_path: str, bucket_reso: Tuple[int, int]
+    ) -> Tuple[Optional[np.ndarray], Optional[List[int]], Optional[List[int]], Optional[np.ndarray], Optional[np.ndarray]]:
+        return self._default_load_latents_from_disk(8, npz_path, bucket_reso)
 
     # TODO remove circular dependency for ImageInfo
     def cache_batch_latents(self, vae, image_infos: List, flip_aug: bool, alpha_mask: bool, random_crop: bool):
@@ -165,7 +182,9 @@ class SdSdxlLatentsCachingStrategy(LatentsCachingStrategy):
         vae_device = vae.device
         vae_dtype = vae.dtype
 
-        self._default_cache_batch_latents(encode_by_vae, vae_device, vae_dtype, image_infos, flip_aug, alpha_mask, random_crop)
+        self._default_cache_batch_latents(
+            encode_by_vae, vae_device, vae_dtype, image_infos, flip_aug, alpha_mask, random_crop, multi_resolution=True
+        )
 
-        if not train_util.HIGH_VRAM:
-            train_util.clean_memory_on_device(vae.device)
+        if not accelerator_setup.HIGH_VRAM:
+            device_utils.clean_memory_on_device(vae.device)

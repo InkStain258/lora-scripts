@@ -6,16 +6,20 @@ import os
 
 import torch
 from library.device_utils import init_ipex
+
 init_ipex()
 
 import diffusers
 from transformers import CLIPTextModel, CLIPTokenizer, CLIPTextConfig, logging
+from library.clip_text_model import wrap_clip_text_model, unwrap_clip_text_model
 from diffusers import AutoencoderKL, DDIMScheduler, StableDiffusionPipeline  # , UNet2DConditionModel
 from safetensors.torch import load_file, save_file
 from library.original_unet import UNet2DConditionModel
 from library.utils import setup_logging
+
 setup_logging()
 import logging
+
 logger = logging.getLogger(__name__)
 
 # DiffUsers版StableDiffusionのモデルパラメータ
@@ -49,7 +53,8 @@ V2_UNET_PARAMS_CONTEXT_DIM = 1024
 
 # Diffusersの設定を読み込むための参照モデル
 DIFFUSERS_REF_MODEL_ID_V1 = "runwayml/stable-diffusion-v1-5"
-DIFFUSERS_REF_MODEL_ID_V2 = "stabilityai/stable-diffusion-2-1"
+# stabilityai/stable-diffusion-2-1 is no longer accessible on the Hub; sd2-community/stable-diffusion-2-1 is a mirror
+DIFFUSERS_REF_MODEL_ID_V2 = "sd2-community/stable-diffusion-2-1"
 
 
 # region StableDiffusion->Diffusersの変換コード
@@ -974,7 +979,7 @@ def load_checkpoint_with_text_encoder_conversion(ckpt_path, device="cpu"):
         checkpoint = None
         state_dict = load_file(ckpt_path)  # , device) # may causes error
     else:
-        checkpoint = torch.load(ckpt_path, map_location=device)
+        checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
         if "state_dict" in checkpoint:
             state_dict = checkpoint["state_dict"]
         else:
@@ -1002,6 +1007,12 @@ def load_models_from_stable_diffusion_checkpoint(v2, ckpt_path, device="cpu", dt
     # Convert the UNet2DConditionModel model.
     unet_config = create_unet_diffusers_config(v2, unet_use_linear_projection_in_v2)
     converted_unet_checkpoint = convert_ldm_unet_checkpoint(v2, state_dict, unet_config)
+
+    # Inpainting checkpoints have conv_in with 9 input channels instead of 4.
+    # Detect this from the converted weights and update the config accordingly.
+    actual_in_channels = converted_unet_checkpoint["conv_in.weight"].shape[1]
+    if actual_in_channels != UNET_PARAMS_IN_CHANNELS:
+        unet_config["in_channels"] = actual_in_channels
 
     unet = UNet2DConditionModel(**unet_config).to(device)
     info = unet.load_state_dict(converted_unet_checkpoint)
@@ -1039,7 +1050,7 @@ def load_models_from_stable_diffusion_checkpoint(v2, ckpt_path, device="cpu", dt
             torch_dtype="float32",
             transformers_version="4.25.0.dev0",
         )
-        text_model = CLIPTextModel._from_config(cfg)
+        text_model = wrap_clip_text_model(CLIPTextModel._from_config(cfg))
         info = text_model.load_state_dict(converted_text_encoder_checkpoint)
     else:
         converted_text_encoder_checkpoint = convert_ldm_clip_checkpoint_v1(state_dict)
@@ -1068,7 +1079,7 @@ def load_models_from_stable_diffusion_checkpoint(v2, ckpt_path, device="cpu", dt
             projection_dim=768,
             torch_dtype="float32",
         )
-        text_model = CLIPTextModel._from_config(cfg)
+        text_model = wrap_clip_text_model(CLIPTextModel._from_config(cfg))
         info = text_model.load_state_dict(converted_text_encoder_checkpoint)
     logger.info(f"loading text encoder: {info}")
 
@@ -1249,7 +1260,7 @@ def save_diffusers_checkpoint(v2, output_dir, text_encoder, unet, pretrained_mod
 
     pipeline = StableDiffusionPipeline(
         unet=diffusers_unet,
-        text_encoder=text_encoder,
+        text_encoder=unwrap_clip_text_model(text_encoder),
         vae=vae,
         scheduler=scheduler,
         tokenizer=tokenizer,
@@ -1308,6 +1319,72 @@ def load_vae(vae_id, dtype):
 
 
 # endregion
+
+
+def expand_unet_to_inpainting(unet) -> None:
+    """
+    Expand a standard 4-channel UNet input conv to 9 channels for inpainting training.
+
+    Inpainting UNets expect 9 input channels: 4 noisy latents + 1 mask + 4 masked-image
+    latents.  When starting from a standard (non-inpainting) checkpoint the input conv
+    weight has shape [out, 4, kH, kW].  This function replaces it with a new Conv2d whose
+    weight has shape [out, 9, kH, kW], copying the original 4-channel weights into the
+    first 4 channels and zero-initialising the remaining 5.  The bias (if present) is
+    copied as-is.
+
+    Supports both diffusers-style UNets (unet.conv_in, unet.config) and the custom SDXL
+    UNet (unet.input_blocks[0][0], unet.in_channels).  The replacement is done in-place.
+    """
+    import torch.nn as nn
+
+    # Locate the first conv and choose how to replace it
+    if hasattr(unet, "conv_in"):
+        # Diffusers-style UNet (SD1.5 / SD2)
+        old_conv = unet.conv_in
+        use_conv_in = True
+    elif hasattr(unet, "input_blocks"):
+        # Custom SDXL original UNet
+        old_conv = unet.input_blocks[0][0]
+        use_conv_in = False
+    else:
+        raise AttributeError("Cannot locate input conv on UNet — unknown architecture")
+
+    if old_conv.in_channels == 9:
+        return  # already expanded — nothing to do
+
+    if old_conv.in_channels != 4:
+        raise ValueError(
+            f"Expected input conv to have 4 or 9 input channels, got {old_conv.in_channels}"
+        )
+
+    device = old_conv.weight.device
+    dtype = old_conv.weight.dtype
+
+    new_conv = nn.Conv2d(
+        9,
+        old_conv.out_channels,
+        kernel_size=old_conv.kernel_size,
+        stride=old_conv.stride,
+        padding=old_conv.padding,
+        bias=old_conv.bias is not None,
+    ).to(device=device, dtype=dtype)
+
+    with torch.no_grad():
+        # Zero-initialise all 9 channels, then copy the original 4
+        new_conv.weight.zero_()
+        new_conv.weight[:, :4] = old_conv.weight
+        if old_conv.bias is not None:
+            new_conv.bias.copy_(old_conv.bias)
+
+    if use_conv_in:
+        unet.conv_in = new_conv
+        # diffusers' UNet stores config in a FrozenDict; mutating it directly raises,
+        # so use the register_to_config API to keep unet.config in sync.
+        if hasattr(unet, "register_to_config"):
+            unet.register_to_config(in_channels=9)
+    else:
+        unet.input_blocks[0][0] = new_conv
+    unet.in_channels = 9
 
 
 def make_bucket_resolutions(max_reso, min_size=256, max_size=1024, divisible=64):

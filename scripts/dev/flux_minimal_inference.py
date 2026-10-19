@@ -456,13 +456,13 @@ if __name__ == "__main__":
     # load clip_l (skip for chroma model)
     if args.model_type == "flux":
         logger.info(f"Loading clip_l from {args.clip_l}...")
-        clip_l = flux_utils.load_clip_l(args.clip_l, clip_l_dtype, loading_device)
+        clip_l = flux_utils.load_clip_l(args.clip_l, clip_l_dtype, loading_device, disable_mmap=True)
         clip_l.eval()
     else:
         clip_l = None
 
     logger.info(f"Loading t5xxl from {args.t5xxl}...")
-    t5xxl = flux_utils.load_t5xxl(args.t5xxl, t5xxl_dtype, loading_device)
+    t5xxl = flux_utils.load_t5xxl(args.t5xxl, t5xxl_dtype, loading_device, disable_mmap=True)
     t5xxl.eval()
 
     # if is_fp8(clip_l_dtype):
@@ -471,7 +471,9 @@ if __name__ == "__main__":
     #     t5xxl = accelerator.prepare(t5xxl)
 
     # DiT
-    is_schnell, model = flux_utils.load_flow_model(args.ckpt_path, None, loading_device, model_type=args.model_type)
+    is_schnell, model = flux_utils.load_flow_model(
+        args.ckpt_path, None, loading_device, disable_mmap=True, model_type=args.model_type
+    )
     model.eval()
     logger.info(f"Casting model to {flux_dtype}")
     model.to(flux_dtype)  # make sure model is dtype
@@ -574,12 +576,12 @@ if __name__ == "__main__":
                     elif opt.startswith("g"):
                         guidance = float(opt[1:].strip())
                     elif opt.startswith("m"):
-                        mutipliers = opt[1:].strip().split(",")
-                        if len(mutipliers) != len(lora_models):
+                        multipliers = opt[1:].strip().split(",")
+                        if len(multipliers) != len(lora_models):
                             logger.error(f"Invalid number of multipliers, expected {len(lora_models)}")
                             continue
                         for i, lora_model in enumerate(lora_models):
-                            lora_model.set_multiplier(float(mutipliers[i]))
+                            lora_model.set_multiplier(float(multipliers[i]))
                     elif opt.startswith("n"):
                         negative_prompt = opt[1:].strip()
                         if negative_prompt == "-":

@@ -7,6 +7,7 @@ from transformers import CLIPTextModel, CLIPTextConfig, CLIPTextModelWithProject
 from typing import List
 from diffusers import AutoencoderKL, EulerDiscreteScheduler, UNet2DConditionModel
 from library import model_util
+from library.clip_text_model import wrap_clip_text_model, unwrap_clip_text_model
 from library import sdxl_original_unet
 from library.utils import setup_logging
 
@@ -196,14 +197,17 @@ def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dty
 
     # U-Net
     logger.info("building U-Net")
-    with init_empty_weights():
-        unet = sdxl_original_unet.SdxlUNet2DConditionModel()
-
-    logger.info("loading U-Net from checkpoint")
     unet_sd = {}
     for k in list(state_dict.keys()):
         if k.startswith("model.diffusion_model."):
             unet_sd[k.replace("model.diffusion_model.", "")] = state_dict.pop(k)
+
+    # Inpainting checkpoints have input_blocks.0.0.weight with 9 in_channels instead of 4.
+    actual_in_channels = unet_sd["input_blocks.0.0.weight"].shape[1]
+    with init_empty_weights():
+        unet = sdxl_original_unet.SdxlUNet2DConditionModel(in_channels=actual_in_channels)
+
+    logger.info("loading U-Net from checkpoint")
     info = _load_state_dict_on_device(unet, unet_sd, device=map_location, dtype=dtype)
     logger.info(f"U-Net: {info}")
 
@@ -233,7 +237,7 @@ def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dty
         # transformers_version="4.25.0.dev0",
     )
     with init_empty_weights():
-        text_model1 = CLIPTextModel._from_config(text_model1_cfg)
+        text_model1 = wrap_clip_text_model(CLIPTextModel._from_config(text_model1_cfg))
 
     # Text Encoder 2 is different from Stability AI's SDXL. SDXL uses open clip, but we use the model from HuggingFace.
     # Note: Tokenizer from HuggingFace is different from SDXL. We must use open clip's tokenizer.
@@ -561,6 +565,7 @@ def save_diffusers_checkpoint(
             model.config._name_or_path = None
             model.config._name_or_path = None
 
+    text_encoder1 = unwrap_clip_text_model(text_encoder1)
     remove_name_or_path(diffusers_unet)
     remove_name_or_path(text_encoder1)
     remove_name_or_path(text_encoder2)
